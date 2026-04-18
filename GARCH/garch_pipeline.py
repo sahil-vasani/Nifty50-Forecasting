@@ -1,58 +1,83 @@
 import pandas as pd
 import numpy as np
-from arch import arch_model
-import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import pickle
 
 # =========================
 # LOAD DATA
 # =========================
-df = pd.read_csv("nifty_features.csv")
-
-returns = df["target"] * 100   # IMPORTANT: scale (GARCH needs %)
-
-# =========================
-# CHECK BASIC STATS
-# =========================
-print("Mean:", returns.mean())
-print("Std:", returns.std())
+df = pd.read_csv("../nifty_final_dataset.csv")
+df = df.dropna().reset_index(drop=True)
 
 # =========================
-# BUILD GARCH(1,1)
+# RETURNS (in %)
 # =========================
-model = arch_model(
-    returns,
-    vol='Garch',
-    p=1,
-    q=1,
-    mean='Zero'   # returns ≈ 0 mean
+returns = df["target"].values * 100
+
+# =========================
+# GARCH(1,1) LOG LIKELIHOOD
+# =========================
+def garch_loglik(params, returns):
+    omega, alpha, beta = params
+    
+    T = len(returns)
+    var = np.zeros(T)
+    
+    # initialize variance
+    var[0] = np.var(returns)
+    
+    for t in range(1, T):
+        var[t] = omega + alpha * returns[t-1]**2 + beta * var[t-1]
+    
+    # avoid zero variance
+    var = np.clip(var, 1e-6, None)
+    
+    loglik = -0.5 * np.sum(
+        np.log(2 * np.pi) +
+        np.log(var) +
+        (returns**2) / var
+    )
+    
+    return -loglik  # minimize
+
+# =========================
+# INITIAL GUESS
+# =========================
+init_params = [0.1, 0.1, 0.8]
+
+bounds = [
+    (1e-6, 1),   # omega
+    (0, 1),      # alpha
+    (0, 1)       # beta
+]
+
+# =========================
+# FIT MODEL
+# =========================
+result = minimize(
+    garch_loglik,
+    init_params,
+    args=(returns,),
+    bounds=bounds
 )
 
-res = model.fit(disp='off')
-import pickle
+omega, alpha, beta = result.x
 
-with open("garch_model.pkl", "wb") as f:
-    pickle.dump(res, f)
-print("\n===== GARCH SUMMARY =====")
-print(res.summary())
-
-# =========================
-# FORECAST VOLATILITY
-# =========================
-forecast = res.forecast(horizon=1)
-
-# variance → std
-volatility = np.sqrt(forecast.variance.values[-1][0])
-
-print("\n===== NEXT DAY VOLATILITY =====")
-print(f"Predicted Volatility: {volatility:.4f}%")
+print("\n===== TRAINED PARAMETERS =====")
+print(f"Omega : {omega:.6f}")
+print(f"Alpha : {alpha:.6f}")
+print(f"Beta  : {beta:.6f}")
 
 # =========================
-# PLOT VOLATILITY
+# SAVE MODEL
 # =========================
-cond_vol = res.conditional_volatility
+model = {
+    "omega": omega,
+    "alpha": alpha,
+    "beta": beta
+}
 
-plt.figure(figsize=(10,5))
-plt.plot(cond_vol, label="Conditional Volatility")
-plt.title("Volatility Over Time (GARCH)")
-plt.legend()
-plt.show()
+with open("garch_scratch.pkl", "wb") as f:
+    pickle.dump(model, f)
+
+print("\nModel saved successfully!")

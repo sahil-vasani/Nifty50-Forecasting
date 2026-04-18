@@ -5,28 +5,37 @@ import yfinance as yf
 # =========================
 # CONFIG
 # =========================
-TICKER = "^NSEI"   # NIFTY50
-START_DATE = "2020-01-01"
-END_DATE = "2025-01-01"
+START = "2018-01-01"
+END = "2026-03-31"
+TICKER = "^NSEI"
+
+SECTOR_TICKERS = {
+    "bank": "^NSEBANK",
+    "it": "^CNXIT",
+    "pharma": "^CNXPHARMA",
+    "auto": "^CNXAUTO",
+    "fmcg": "^CNXFMCG",
+    "metal": "^CNXMETAL",
+    "energy": "^CNXENERGY"
+}
 
 # =========================
-# DOWNLOAD DATA
+# DOWNLOAD NIFTY
 # =========================
 def download_data():
-    df = yf.download(TICKER, start=START_DATE, end=END_DATE, interval="1d", auto_adjust=True)
+    df = yf.download(TICKER, start=START, end=END, auto_adjust=True)
 
-    # Flatten columns
+    # flatten columns
     df.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in df.columns]
 
     df = df.reset_index()
-
-    # ✅ FIX: standardize date column
     df.rename(columns={'Date': 'date'}, inplace=True)
 
     return df
 
+
 # =========================
-# FEATURE ENGINEERING
+# FEATURE ENGINEERING (TECHNICAL)
 # =========================
 def create_features(df):
 
@@ -40,14 +49,14 @@ def create_features(df):
     df['vol_5'] = df['log_ret'].rolling(5).std()
     df['vol_15'] = df['log_ret'].rolling(15).std()
 
-    # ---------- Candle Features ----------
+    # ---------- Candle ----------
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
     df['close_pos'] = (df['close'] - df['low']) / (df['range'] + 1e-9)
 
-    # ---------- Moving Averages ----------
+    # ---------- Moving Avg ----------
     df['ma_5'] = df['close'].rolling(5).mean()
     df['ma_20'] = df['close'].rolling(20).mean()
     df['dist_ma_5'] = (df['close'] - df['ma_5']) / df['ma_5']
@@ -57,86 +66,138 @@ def create_features(df):
     df['volume_ma_5'] = df['volume'].rolling(5).mean()
     df['volume_spike'] = df['volume'] / (df['volume_ma_5'] + 1e-9)
 
-    # ---------- Target (Next Day Return) ----------
+    # ---------- Target ----------
     df['target'] = df['close'].pct_change().shift(-1)
 
-    # Drop NaN
-    df = df.dropna().reset_index(drop=True)
-
     return df
 
+
 # =========================
-# ADD SECTOR DATA (OPTIONAL)
+# ADD SECTOR FEATURES
 # =========================
 def add_sector_features(df):
-    print("Adding sector features...")
 
-    # -------- BANK NIFTY --------
-    bank = yf.download("^NSEBANK", start=START_DATE, end=END_DATE, auto_adjust=True)
+    for name, ticker in SECTOR_TICKERS.items():
+        print(f"Downloading {name}...")
 
-    # Flatten columns
-    bank.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in bank.columns]
+        temp = yf.download(ticker, start=START, end=END, auto_adjust=True)
 
-    bank['bank_ret'] = bank['close'].pct_change()
-    bank = bank[['bank_ret']]
+        temp.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in temp.columns]
 
-    # -------- IT INDEX --------
-    it = yf.download("^CNXIT", start=START_DATE, end=END_DATE, auto_adjust=True)
+        temp = temp.reset_index()
+        temp.rename(columns={'Date': 'date'}, inplace=True)
 
-    # Flatten columns
-    it.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in it.columns]
+        temp[f"{name}_ret"] = temp['close'].pct_change()
 
-    it['it_ret'] = it['close'].pct_change()
-    it = it[['it_ret']]
+        df = df.merge(temp[['date', f"{name}_ret"]], on='date', how='left')
 
-    # -------- RESET INDEX FOR MERGE --------
-    bank = bank.reset_index()
-    it = it.reset_index()
+    return df
 
-    # Rename date column for consistency
-    bank.rename(columns={'Date': 'date'}, inplace=True)
-    it.rename(columns={'Date': 'date'}, inplace=True)
 
-    # -------- MERGE --------
-    df = df.merge(bank, on='date', how='left')
-    df = df.merge(it, on='date', how='left')
+# =========================
+# CONTAGION FEATURES 🔥
+# =========================
+def add_contagion_features(df):
 
+    # lag features
+    for col in df.columns:
+        if "_ret" in col and col != "ret_1":
+            df[f"{col}_lag1"] = df[col].shift(1)
+            df[f"{col}_lag2"] = df[col].shift(2)
+
+    # rolling correlation
+    for col in df.columns:
+        if "_ret" in col and col != "ret_1":
+            df[f"corr_nifty_{col}"] = df["ret_1"].rolling(10).corr(df[col])
+
+    return df
+
+def advanced_features(df):
+    
+    # =========================
+    # 1. TREND FEATURES 🔥
+    # =========================
+    df["trend_strength"] = df["ma_5"] - df["ma_20"]
+
+    # =========================
+    # 2. MOMENTUM 🔥
+    # =========================
+    df["momentum"] = df["close"] - df["close"].shift(5)
+
+    # =========================
+    # 3. RSI (VERY IMPORTANT) 🔥
+    # =========================
+    delta = df["close"].diff()
+
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
+    rs = gain / (loss + 1e-9)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # =========================
+    # 4. MARKET REGIME 🔥
+    # =========================
+    df["high_vol"] = (df["vol_5"] > df["vol_15"]).astype(int)
+
+    # =========================
+    # 5. SECTOR DOMINANCE 🔥 (VERY IMPORTANT)
+    # =========================
+    sector_cols = [
+        "bank_ret","it_ret","pharma_ret",
+        "auto_ret","fmcg_ret","metal_ret","energy_ret"
+    ]
+
+    df["sector_mean"] = df[sector_cols].mean(axis=1)
+    df["sector_std"] = df[sector_cols].std(axis=1)
+
+    # strongest sector each day
+    df["strongest_sector"] = df[sector_cols].idxmax(axis=1)
+
+    # =========================
+    # 6. RELATIVE STRENGTH 🔥
+    # =========================
+    for col in sector_cols:
+        df[f"{col}_vs_nifty"] = df[col] - df["ret_1"]
+
+    # =========================
+    # CLEAN
+    # =========================
     df = df.dropna().reset_index(drop=True)
 
     return df
+
 
 # =========================
 # FINAL PIPELINE
 # =========================
 def build_dataset():
+
     df = download_data()
+
     df = create_features(df)
+
     df = add_sector_features(df)
 
-    # Select final features
-    features = [
-        'log_ret',
-        'ret_1', 'ret_5', 'ret_15',
-        'vol_5', 'vol_15',
-        'body', 'range', 'upper_wick', 'lower_wick', 'close_pos',
-        'dist_ma_5', 'dist_ma_20',
-        'volume_spike',
-        'bank_ret', 'it_ret'
-    ]
+    df = add_contagion_features(df)
+    
+    df = advanced_features(df)
 
-    X = df[features]
-    y = df['target']
+    # clean
+    df = df.dropna().reset_index(drop=True)
+    
+    return df
 
-    return X, y, df
 
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
-    X, y, df = build_dataset()
 
-    print("Shape of X:", X.shape)
-    print("Shape of y:", y.shape)
+    df = build_dataset()
 
-    df.to_csv("nifty_features.csv", index=False)
-    print("Dataset saved as nifty_features.csv")
+    print("Final Shape:", df.shape)
+
+    df.to_csv("nifty_final_dataset.csv", index=False)
+
+    print("Dataset saved ✅")
