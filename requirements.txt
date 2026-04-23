@@ -1,0 +1,23 @@
+# Core Data Processing
+pandas>=1.5.0
+numpy>=1.23.0
+
+# Data Download
+yfinance>=0.2.0
+
+# Statistical Modeling
+statsmodels>=0.13.0
+scipy>=1.9.0
+
+# Machine Learning
+scikit-learn>=1.2.0
+
+# Deep Learning
+torch>=2.0.0
+
+# Visualization
+matplotlib>=3.6.0
+plotly>=5.12.0
+
+# Utilities
+pickle-mixin>=0.0.1
