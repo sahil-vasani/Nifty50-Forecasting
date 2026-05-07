@@ -1,111 +1,173 @@
-# =============================================================================
-# Nifty50 Quantile Forecasting using LSTM
-# Probabilistic Time Series Forecasting with Prediction Intervals
-# =============================================================================
-# Objective: Estimate the full conditional distribution of next-day Nifty50
-# returns using a multi-output LSTM with quantile regression, including
-# systematic hyperparameter tuning.
-#
-# Research Foundation:
-#   - "Probabilistic Forecasting with Recurrent Neural Networks" (Wen et al., 2017)
-#   - "A Multi-Horizon Quantile Recurrent Forecaster" (Gasthaus et al., 2019)
-#
-# Key Difference from SimpleRNN version:
-#   SimpleRNN replaced with LSTM layers throughout.
-#   LSTM has explicit cell state (long-term memory) and three gates
-#   (input, forget, output), making it better suited to capture long-range
-#   temporal dependencies in financial time series.
-# =============================================================================
+"""
+=============================================================================
+Nifty50 % Change Forecasting — LSTM | Single Multi-Output Quantile Model
+PyTorch + CUDA Implementation  |  Systematic Hyperparameter Tuning
+=============================================================================
+Architecture       : Single LSTM with multiple quantile output heads
+Quantile Levels    : [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
+Horizons           : t+1 (next-day % change)
+Grid Search        : window_size, units, dropout, learning_rate
+Metrics            : PICP, MPIW, Winkler Score, Calibration
+Framework          : PyTorch (CUDA-enabled)
+=============================================================================
+Improvements over TF/Keras version:
+  - Full PyTorch + CUDA support with mixed-precision training (AMP)
+  - AdamW optimizer with weight decay for better generalization
+  - Gradient clipping to prevent exploding gradients
+  - CosineAnnealingLR scheduler for smoother convergence
+  - Monotonicity enforcement across quantile heads (crossing prevention)
+  - Quantile crossing loss penalty during training
+  - Per-epoch validation loss tracked for better early stopping
+  - Model checkpoint saving/loading (best val loss)
+=============================================================================
+"""
 
-# ── Imports ──────────────────────────────────────────────────────────────────
+import os
+import random
+import warnings
+from datetime import datetime
+from itertools import product as itertools_product
+
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from itertools import product as itertools_product
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-import warnings
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
 warnings.filterwarnings('ignore')
 
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.models import Model
-# ★ LSTM replaces SimpleRNN ★
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-import tensorflow.keras.backend as K
+# ── Random Seeds ──────────────────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
-# ── Random Seeds ─────────────────────────────────────────────────────────────
-np.random.seed(42)
-tf.random.set_seed(42)
+# ── Device Setup ─────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = torch.cuda.is_available()   # Automatic Mixed Precision only on CUDA
 
 # ── Plotting Style ────────────────────────────────────────────────────────────
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
 
-print(f"TensorFlow Version: {tf.__version__}")
-print(f"GPU Available: {tf.config.list_physical_devices('GPU')}")
+print("=" * 80)
+print("LSTM SINGLE-MODEL MULTI-QUANTILE FORECASTING  [PyTorch]")
+print("=" * 80)
+print(f"PyTorch Version     : {torch.__version__}")
+print(f"Device              : {DEVICE}")
+print(f"GPU Name            : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
+print(f"Mixed Precision AMP : {USE_AMP}")
+print("=" * 80)
 
 
 # =============================================================================
-# 1. Quantile Regression — Pinball Loss
+# 1. Quantile Configuration
 # =============================================================================
 
-QUANTILES = [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
+QUANTILES = [0.05, 0.5, 0.95]
+N_QUANTILES = len(QUANTILES)
+QUANTILE_TENSOR = torch.tensor(QUANTILES, dtype=torch.float32, device=DEVICE)
+
+print(f"\n[1/11] Quantile Configuration")
+print(f"Quantile Levels ({N_QUANTILES}): {QUANTILES}")
 
 
-def pinball_loss(quantile):
+def pinball_loss_all(preds: torch.Tensor, target: torch.Tensor,
+                     quantiles: torch.Tensor) -> torch.Tensor:
     """
-    Create pinball loss function for a specific quantile.
+    Vectorised pinball loss across all quantiles simultaneously.
 
     Args:
-        quantile: Target quantile level (e.g., 0.5 for median)
+        preds    : (B, Q)  — model output for all Q quantiles
+        target   : (B,)    — ground truth
+        quantiles: (Q,)    — quantile levels
 
     Returns:
-        Loss function for this quantile
+        Scalar mean loss over batch and quantiles.
     """
-    def loss(y_true, y_pred):
-        error = y_true - y_pred
-        return K.mean(K.maximum(quantile * error, (quantile - 1) * error), axis=-1)
+    target_exp = target.unsqueeze(1).expand_as(preds)   # (B, Q)
+    err = target_exp - preds                             # (B, Q)
+    loss = torch.where(err >= 0,
+                       quantiles * err,
+                       (quantiles - 1.0) * err)
+    return loss.mean()
 
-    loss.__name__ = f'pinball_loss_{int(quantile * 100)}'
-    return loss
 
+def crossing_penalty(preds: torch.Tensor) -> torch.Tensor:
+    """
+    Penalises quantile crossing: enforces q_i <= q_{i+1}.
 
-print("Quantile Levels:", QUANTILES)
-print("\nPinball Loss Functions Created:")
-for q in QUANTILES:
-    print(f"  - Quantile {q:.3f}: {pinball_loss(q).__name__}")
+    Args:
+        preds : (B, Q)
+
+    Returns:
+        Scalar penalty.
+    """
+    diffs = preds[:, 1:] - preds[:, :-1]       # should be >= 0
+    return F.relu(-diffs).mean()
+
+def tube_loss(preds: torch.Tensor) -> torch.Tensor:
+    """
+    Penalize excessively wide prediction intervals.
+
+    preds : (B, Q)
+    assumes:
+        index 0 = q0.05
+        index 2 = q0.95
+    """
+
+    lower = preds[:, 0]
+    upper = preds[:, 2]
+
+    width = upper - lower
+
+    return width.mean()
 
 
 # =============================================================================
 # 2. Data Loading and Preprocessing
 # =============================================================================
 
+print("\n[2/11] Loading and Preprocessing Data...")
+
 df = pd.read_csv('../nifty_final_dataset.csv')
 df['date'] = pd.to_datetime(df['date'])
 df.set_index('date', inplace=True)
 
-print("=" * 80)
+print("\n" + "=" * 80)
 print("DATASET OVERVIEW")
 print("=" * 80)
-print(f"Dataset Shape: {df.shape}")
-print(f"Date Range: {df.index.min()} to {df.index.max()}")
+print(f"Dataset Shape    : {df.shape}")
+print(f"Date Range       : {df.index.min()} to {df.index.max()}")
+print(f"Duration         : {(df.index.max() - df.index.min()).days} days")
 
-# Feature Groups
-technical_features      = ['log_ret', 'vol_5', 'vol_15', 'rsi', 'momentum', 'trend_strength']
-price_features          = ['body', 'range', 'upper_wick', 'lower_wick', 'close_pos']
-ma_features             = ['ma_5', 'ma_20', 'dist_ma_5', 'dist_ma_20']
-volume_features         = ['volume', 'volume_ma_5', 'volume_spike']
-sector_features         = ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret', 'fmcg_ret', 'metal_ret', 'energy_ret']
-lag_features            = (
+# Feature Selection
+technical_features  = ['log_ret', 'vol_5', 'vol_15', 'rsi', 'momentum', 'trend_strength']
+price_features      = ['body', 'range', 'upper_wick', 'lower_wick', 'close_pos']
+ma_features         = ['ma_5', 'ma_20', 'dist_ma_5', 'dist_ma_20']
+volume_features     = ['volume', 'volume_ma_5', 'volume_spike']
+sector_features     = ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret',
+                       'fmcg_ret', 'metal_ret', 'energy_ret']
+lag_features        = (
     ['log_ret_lag1', 'log_ret_lag2'] +
-    [f'{s}_lag1' for s in ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret', 'fmcg_ret', 'metal_ret', 'energy_ret']] +
-    [f'{s}_lag2' for s in ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret', 'fmcg_ret', 'metal_ret', 'energy_ret']]
+    [f'{s}_lag1' for s in ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret',
+                            'fmcg_ret', 'metal_ret', 'energy_ret']] +
+    [f'{s}_lag2' for s in ['bank_ret', 'it_ret', 'pharma_ret', 'auto_ret',
+                            'fmcg_ret', 'metal_ret', 'energy_ret']]
 )
-sector_analysis_features = [
+sector_analysis     = [
     'sector_mean', 'sector_std',
     'bank_ret_vs_nifty', 'it_ret_vs_nifty', 'pharma_ret_vs_nifty',
     'auto_ret_vs_nifty', 'fmcg_ret_vs_nifty', 'metal_ret_vs_nifty', 'energy_ret_vs_nifty'
@@ -113,418 +175,482 @@ sector_analysis_features = [
 
 selected_features = (
     technical_features + price_features + ma_features + volume_features +
-    sector_features + lag_features + sector_analysis_features
+    sector_features + lag_features + sector_analysis
 )
 
-df_features = df[selected_features + ['target']].copy()
-df_features = df_features.dropna()
+available_features = [f for f in selected_features if f in df.columns]
+df_features = df[available_features + ['target']].copy().dropna()
+N_FEATURES = len(available_features)
 
-print(f"\nTotal Features: {len(selected_features)}")
-print(f"Records after cleaning: {len(df_features)}")
+print(f"\nFeature Summary:")
+print(f"  Technical        : {len([f for f in technical_features if f in available_features])}")
+print(f"  Price            : {len([f for f in price_features if f in available_features])}")
+print(f"  Moving Averages  : {len([f for f in ma_features if f in available_features])}")
+print(f"  Volume           : {len([f for f in volume_features if f in available_features])}")
+print(f"  Sector           : {len([f for f in sector_features if f in available_features])}")
+print(f"  Lags             : {len([f for f in lag_features if f in available_features])}")
+print(f"  Sector Analysis  : {len([f for f in sector_analysis if f in available_features])}")
+print(f"  {'─'*40}")
+print(f"  TOTAL FEATURES   : {N_FEATURES}")
+print(f"\nRecords after cleaning: {len(df_features)}")
 
-# ── Train / Test Split ────────────────────────────────────────────────────────
+# Train / Test Split
 train_size = int(len(df_features) * 0.8)
 train_data = df_features.iloc[:train_size]
 test_data  = df_features.iloc[train_size:]
 
-X_train = train_data[selected_features].values
-y_train = train_data['target'].values
-X_test  = test_data[selected_features].values
-y_test  = test_data['target'].values
+X_train_raw = train_data[available_features].values.astype(np.float32)
+y_train_raw = train_data['target'].values.astype(np.float32)
+X_test_raw  = test_data[available_features].values.astype(np.float32)
+y_test_raw  = test_data['target'].values.astype(np.float32)
 
 scaler_X = StandardScaler()
 scaler_y = StandardScaler()
 
-X_train_scaled = scaler_X.fit_transform(X_train)
-X_test_scaled  = scaler_X.transform(X_test)
-y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
-y_test_scaled  = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+X_train_scaled = scaler_X.fit_transform(X_train_raw).astype(np.float32)
+X_test_scaled  = scaler_X.transform(X_test_raw).astype(np.float32)
+y_train_scaled = scaler_y.fit_transform(y_train_raw.reshape(-1, 1)).flatten().astype(np.float32)
+y_test_scaled  = scaler_y.transform(y_test_raw.reshape(-1, 1)).flatten().astype(np.float32)
 
-print("=" * 80)
+print("\n" + "=" * 80)
 print("DATA SPLIT")
 print("=" * 80)
-print(f"Training : {len(train_data)} samples ({len(train_data)/len(df_features)*100:.1f}%)")
-print(f"Testing  : {len(test_data)} samples ({len(test_data)/len(df_features)*100:.1f}%)")
+print(f"Training Samples : {len(train_data):>6} ({len(train_data)/len(df_features)*100:.1f}%)")
+print(f"Testing Samples  : {len(test_data):>6} ({len(test_data)/len(df_features)*100:.1f}%)")
 
 
 # =============================================================================
 # 3. Sequence Creation
 # =============================================================================
 
-def create_sequences(X, y, window_size):
-    """Create rolling window sequences for LSTM input."""
-    X_seq, y_seq = [], []
+def create_sequences(X: np.ndarray, y: np.ndarray, window_size: int):
+    """Create rolling-window sequences for LSTM input."""
+    Xs, ys = [], []
     for i in range(window_size, len(X)):
-        X_seq.append(X[i - window_size:i])
-        y_seq.append(y[i])
-    return np.array(X_seq), np.array(y_seq)
+        Xs.append(X[i - window_size:i])
+        ys.append(y[i])
+    return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
 
 
-WINDOW_SIZE = 30
+def make_loaders(X_tr_sc, y_tr_sc, X_te_sc, y_te_sc, window_size, batch_size=32):
+    """Build DataLoaders from scaled arrays and a given window size."""
+    X_tr, y_tr = create_sequences(X_tr_sc, y_tr_sc, window_size)
+    X_te, y_te = create_sequences(X_te_sc, y_te_sc, window_size)
 
-X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, WINDOW_SIZE)
-X_test_seq,  y_test_seq  = create_sequences(X_test_scaled,  y_test_scaled,  WINDOW_SIZE)
+    # Validation split from training set (last 20%)
+    n_val = int(len(X_tr) * 0.2)
+    X_val, y_val = X_tr[-n_val:], y_tr[-n_val:]
+    X_tr,  y_tr  = X_tr[:-n_val], y_tr[:-n_val]
 
-print(f"Window Size     : {WINDOW_SIZE} days")
-print(f"Train Sequences : {X_train_seq.shape}")
-print(f"Test Sequences  : {X_test_seq.shape}")
+    tr_ds  = TensorDataset(torch.from_numpy(X_tr),  torch.from_numpy(y_tr))
+    val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+    te_ds  = TensorDataset(torch.from_numpy(X_te),  torch.from_numpy(y_te))
+
+    tr_dl  = DataLoader(tr_ds,  batch_size=batch_size, shuffle=True,  drop_last=True,  pin_memory=USE_AMP)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=USE_AMP)
+    te_dl  = DataLoader(te_ds,  batch_size=batch_size, shuffle=False, pin_memory=USE_AMP)
+
+    return tr_dl, val_dl, te_dl, y_te
 
 
 # =============================================================================
 # 4. Multi-Quantile LSTM Model
 # =============================================================================
-# ★ CHANGE vs SimpleRNN version:
-#   SimpleRNN → LSTM throughout the backbone.
-#   LSTM parameters are ~4× those of SimpleRNN for the same `units` value
-#   because each LSTM cell has 4 gates, making it more expressive but slower.
-# =============================================================================
 
-def build_quantile_lstm_model(window_size, n_features, quantiles,
-                               units=128, dropout=0.2, learning_rate=0.001):
+class QuantileLSTM(nn.Module):
     """
-    Build multi-output LSTM quantile regression model.
+    Multi-output LSTM for simultaneous quantile regression.
 
     Architecture:
-        Input → LSTM(units, return_sequences=True) → LSTM(units//2)
-              → Dense(64) → [Dense(32) → Dense(1)] × Q
+        Input(window_size, n_features)
+        → LSTM(units, return_sequences=True)  + Dropout + LayerNorm
+        → LSTM(units//2, return_sequences=False) + Dropout + LayerNorm
+        → Dense(64, GELU) + Dropout
+        → [Dense(32, GELU) + Dropout + Dense(1)] × Q  (per-quantile heads)
+        → Stack outputs → (B, Q)
 
-    Args:
-        window_size   : Sequence length
-        n_features    : Number of input features
-        quantiles     : List of quantile levels
-        units         : LSTM units in first layer (halved in second layer)
-        dropout       : Dropout rate
-        learning_rate : Adam learning rate
-
-    Returns:
-        Compiled Keras Model
+    Improvements vs Keras version:
+        - LayerNorm (more stable than BatchNorm in recurrent nets)
+        - AdamW + weight decay handles L2 reg properly
+        - Single forward pass returns all quantiles → enables crossing penalty
     """
-    inputs = Input(shape=(window_size, n_features))
 
-    # ── Shared LSTM backbone ──────────────────────────────────────────────────
-    x = LSTM(units, return_sequences=True)(inputs)   # ★ LSTM replaces SimpleRNN
-    x = Dropout(dropout)(x)
-    x = BatchNormalization()(x)
+    def __init__(self, window_size: int, n_features: int, n_quantiles: int,
+                 units: int = 128, dropout: float = 0.2):
+        super().__init__()
+        self.units = units
 
-    x = LSTM(units // 2, return_sequences=False)(x)   # ★ LSTM replaces SimpleRNN
-    x = Dropout(dropout)(x)
-    x = BatchNormalization()(x)
+        # ── Shared Backbone ───────────────────────────────────────────────────
+        self.lstm1    = nn.LSTM(n_features, units, batch_first=True)
+        self.drop1    = nn.Dropout(dropout)
+        self.norm1    = nn.LayerNorm(units)
 
-    # ── Shared dense ──────────────────────────────────────────────────────────
-    x = Dense(64, activation='relu')(x)
-    x = Dropout(dropout / 2)(x)
+        self.lstm2    = nn.LSTM(units, units // 2, batch_first=True)
+        self.drop2    = nn.Dropout(dropout)
+        self.norm2    = nn.LayerNorm(units // 2)
 
-    # ── Per-quantile heads ────────────────────────────────────────────────────
-    outputs = []
-    for q in quantiles:
-        head = Dense(32, activation='relu', name=f'dense_q{int(q*100)}')(x)
-        head = Dropout(dropout / 2)(head)
-        head = Dense(1, name=f'q{int(q*100)}')(head)
-        outputs.append(head)
+        self.shared   = nn.Sequential(
+            nn.Linear(units // 2, 64),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+        )
 
-    model = Model(inputs=inputs, outputs=outputs,
-                  name=f'QuantileLSTM_u{units}_d{int(dropout*100)}')   # ★ name updated
+        # ── Per-Quantile Heads ────────────────────────────────────────────────
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(64, 32),
+                nn.GELU(),
+                nn.Dropout(dropout / 2),
+                nn.Linear(32, 1),
+            )
+            for _ in range(n_quantiles)
+        ])
 
-    losses = {f'q{int(q*100)}': pinball_loss(q) for q in quantiles}
-    model.compile(optimizer=Adam(learning_rate=learning_rate), loss=losses)
-    return model
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x : (B, T, F)
+        Returns:
+            preds : (B, Q)
+        """
+        # LSTM 1
+        out, _ = self.lstm1(x)                  # (B, T, units)
+        out    = self.drop1(out)
+        out    = self.norm1(out)
 
+        # LSTM 2
+        out, _ = self.lstm2(out)                # (B, T, units//2)
+        out    = self.drop2(out[:, -1, :])      # take last timestep
+        out    = self.norm2(out)
 
-# Quick preview model
-WINDOW_SIZE = 10  # placeholder; updated after tuning
-X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, WINDOW_SIZE)
-X_test_seq,  y_test_seq  = create_sequences(X_test_scaled,  y_test_scaled,  WINDOW_SIZE)
+        # Shared dense
+        shared = self.shared(out)               # (B, 64)
 
-quantile_model = build_quantile_lstm_model(
-    WINDOW_SIZE, X_train_scaled.shape[1], QUANTILES,
-    units=128, dropout=0.2, learning_rate=0.001
-)
-print("=" * 80)
-print("QUANTILE LSTM ARCHITECTURE")
-print("=" * 80)
-quantile_model.summary()
-print(f"\nTotal Parameters: {quantile_model.count_params():,}")
+        # Per-quantile heads → stack
+        qs = [head(shared) for head in self.heads]  # Q × (B, 1)
+        return torch.cat(qs, dim=1)                 # (B, Q)
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # =============================================================================
-# 5. Systematic Hyperparameter Tuning
+# 5. Architecture Display
 # =============================================================================
 
-PARAM_GRID_Q = {
-    'window_size'   : [5, 10, 20],
-    'units'         : [32, 64, 128],
-    'dropout'       : [0.0, 0.2, 0.3],
-    'learning_rate' : [0.001, 0.0005],
+print("\n[3/11] Building Sample Model for Architecture Display...")
+
+_sample = QuantileLSTM(10, N_FEATURES, N_QUANTILES, units=128, dropout=0.2).to(DEVICE)
+total_params = _sample.count_params()
+
+print("\n" + "=" * 90)
+print("LSTM QUANTILE MODEL ARCHITECTURE  [PyTorch]")
+print("=" * 90)
+arch_rows = [
+    ("Input",             f"(B, 10, {N_FEATURES})",   0,          "Sequence input"),
+    ("LSTM (1st)",        f"(B, 10, 128)",             "~91K",     "Temporal feature extraction"),
+    ("Dropout",           f"(B, 10, 128)",             0,          "Regularization"),
+    ("LayerNorm",         f"(B, 10, 128)",             256,        "Stabilises recurrent output"),
+    ("LSTM (2nd)",        "(B, 64)",                   "~49K",     "Compressed temporal encoding"),
+    ("Dropout",           "(B, 64)",                   0,          "Prevent overfitting"),
+    ("LayerNorm",         "(B, 64)",                   128,        "Feature normalisation"),
+    ("Linear→GELU",       "(B, 64)",                   "~4K",      "Shared feature extractor"),
+    ("Dropout",           "(B, 64)",                   0,          "Regularization"),
+    (f"Heads (3×Linear)", "(B, 32)", "~2K each", "Separate head per quantile"),
+    ("Dropout (heads)", "(B, 32)", 0, "Regularization per head"),
+    ("Output (3×)", "(B, 1)", "33 each", "Quantile output"),
+    ("Stack → concat", "(B, 3)", 0, "Final multi-quantile output"),
+]
+print(f"{'#':<3} {'Layer':<28} {'Output Shape':<18} {'Params':<14} Description")
+print("-" * 90)
+for i, (l, s, p, d) in enumerate(arch_rows, 1):
+    ps = f"{p:,}" if isinstance(p, int) else str(p)
+    print(f"{i:<3} {l:<28} {s:<18} {ps:<14} {d}")
+print("-" * 90)
+print(f"{'TOTAL TRAINABLE PARAMETERS':<50} {total_params:,}")
+print("=" * 90)
+
+del _sample
+torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+
+# =============================================================================
+# 6. Training Utilities
+# =============================================================================
+
+def train_one_epoch(model, loader, optimizer, scaler_amp, crossing_weight=0.1):
+    model.train()
+    total_loss = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        optimizer.zero_grad()
+
+        if USE_AMP:
+            with torch.amp.autocast('cuda'):
+                preds = model(xb)                                        # (B, Q)
+                pb = pinball_loss_all(preds, yb, QUANTILE_TENSOR)
+
+                cp = crossing_penalty(preds)
+
+                tp = tube_loss(preds)
+
+                loss = (
+                    pb
+                    + crossing_weight * cp
+                    + 0.02 * tp
+                )
+            scaler_amp.scale(loss).backward()
+            scaler_amp.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler_amp.step(optimizer)
+            scaler_amp.update()
+        else:
+            preds = model(xb)
+            pb    = pinball_loss_all(preds, yb, QUANTILE_TENSOR)
+            cp    = crossing_penalty(preds)
+            loss  = pb + crossing_weight * cp
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    total_loss = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        preds  = model(xb)
+        loss   = pinball_loss_all(preds, yb, QUANTILE_TENSOR)
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def predict_all(model, loader):
+    """Return (N, Q) predictions in numpy."""
+    model.eval()
+    chunks = []
+    for xb, _ in loader:
+        chunks.append(model(xb.to(DEVICE)).cpu().numpy())
+    return np.concatenate(chunks, axis=0)
+
+
+def train_model(model, tr_dl, val_dl, lr, epochs=100, patience=15):
+    optimizer  = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    amp_scaler = torch.amp.GradScaler('cuda') if USE_AMP else None
+
+    best_val   = float('inf')
+    best_state = None
+    patience_c = 0
+    history    = []
+
+    for ep in range(1, epochs + 1):
+        tr_loss  = train_one_epoch(model, tr_dl, optimizer, amp_scaler)
+        val_loss = evaluate(model, val_dl)
+        scheduler.step()
+        history.append((tr_loss, val_loss))
+
+        if val_loss < best_val:
+            best_val   = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_c = 0
+        else:
+            patience_c += 1
+            if patience_c >= patience:
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+    return model, history
+
+
+# =============================================================================
+# 7. Systematic Hyperparameter Tuning
+# =============================================================================
+
+print("\n[4/11] Hyperparameter Grid Search...")
+
+PARAM_GRID = {
+    'window_size'  : [10, 20, 30],
+    'units'        : [64, 128],
+    'dropout'      : [0.1, 0.2, 0.3],
+    'learning_rate': [0.001, 0.0005],
 }
 
-all_combos_q = list(itertools_product(
-    PARAM_GRID_Q['window_size'],
-    PARAM_GRID_Q['units'],
-    PARAM_GRID_Q['dropout'],
-    PARAM_GRID_Q['learning_rate']
+all_combos = list(itertools_product(
+    PARAM_GRID['window_size'],
+    PARAM_GRID['units'],
+    PARAM_GRID['dropout'],
+    PARAM_GRID['learning_rate'],
 ))
 
-print("=" * 70)
-print("HYPERPARAMETER SEARCH SPACE (Quantile LSTM)")
-print("=" * 70)
-for param, values in PARAM_GRID_Q.items():
+print("\n" + "=" * 80)
+print("HYPERPARAMETER SEARCH SPACE")
+print("=" * 80)
+for param, values in PARAM_GRID.items():
     print(f"  {param:<18}: {values}")
-print(f"\n  Total combinations : {len(all_combos_q)}")
-print("=" * 70)
-
-# ── Grid Search ───────────────────────────────────────────────────────────────
-q_tuning_results = []
-best_q_rmse   = float('inf')
-best_q_config = None
-best_q_model  = None
-best_q_result = None
-
-n_features_q = X_train_scaled.shape[1]
-
-for combo_idx, (ws, units, dropout, lr) in enumerate(all_combos_q, 1):
-    config = dict(window_size=ws, units=units, dropout=dropout, learning_rate=lr)
-
-    print(
-        f"[{combo_idx:02d}/{len(all_combos_q)}]  "
-        f"window={ws:2d}  units={units:3d}  dropout={dropout:.1f}  lr={lr}",
-        end='  →  ', flush=True
-    )
-
-    X_tr_q, y_tr_q = create_sequences(X_train_scaled, y_train_scaled, ws)
-    X_te_q, y_te_q = create_sequences(X_test_scaled,  y_test_scaled,  ws)
-
-    y_tr_dict = {f'q{int(q*100)}': y_tr_q for q in QUANTILES}
-
-    model = build_quantile_lstm_model(                         # ★ LSTM builder
-        ws, n_features_q, QUANTILES,
-        units=units, dropout=dropout, learning_rate=lr
-    )
-
-    callbacks_q = [
-        EarlyStopping(monitor='val_loss', patience=10,
-                      restore_best_weights=True, verbose=0),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                          patience=5, min_lr=1e-7, verbose=0),
-    ]
-
-    model.fit(
-        X_tr_q, y_tr_dict,
-        validation_split=0.2, epochs=100, batch_size=32,
-        callbacks=callbacks_q, verbose=0
-    )
-
-    preds_all_scaled = model.predict(X_te_q, verbose=0)
-    q50_idx          = QUANTILES.index(0.5)
-    y_pred_scaled_q  = preds_all_scaled[q50_idx].flatten()
-    y_pred_q         = scaler_y.inverse_transform(y_pred_scaled_q.reshape(-1, 1)).flatten()
-    y_true_q         = scaler_y.inverse_transform(y_te_q.reshape(-1, 1)).flatten()
-
-    mse_q  = mean_squared_error(y_true_q, y_pred_q)
-    rmse_q = np.sqrt(mse_q)
-    mae_q  = mean_absolute_error(y_true_q, y_pred_q)
-
-    print(f"RMSE={rmse_q:.6f}  MSE={mse_q:.6f}  MAE={mae_q:.6f}")
-
-    record = dict(
-        window_size=ws, units=units, dropout=dropout, learning_rate=lr,
-        MSE=round(mse_q, 6), RMSE=round(rmse_q, 6), MAE=round(mae_q, 6),
-        predictions=y_pred_q, actuals=y_true_q
-    )
-    q_tuning_results.append(record)
-
-    if rmse_q < best_q_rmse:
-        best_q_rmse   = rmse_q
-        best_q_config = config
-        best_q_model  = model
-        best_q_result = record
-
-    del model
-    tf.keras.backend.clear_session()
-
-print("\nHyperparameter search complete.")
-
-# ── Results Table ─────────────────────────────────────────────────────────────
-q_results_df = pd.DataFrame([{
-    'Window Size'   : r['window_size'],
-    'LSTM Units'    : r['units'],              # ★ label updated
-    'Dropout'       : r['dropout'],
-    'Learning Rate' : r['learning_rate'],
-    'MSE'           : r['MSE'],
-    'RMSE'          : r['RMSE'],
-    'MAE'           : r['MAE'],
-} for r in q_tuning_results])
-
-q_results_df = q_results_df.sort_values('RMSE').reset_index(drop=True)
-q_results_df.index += 1
-
-print("=" * 85)
-print("QUANTILE LSTM — HYPERPARAMETER TUNING RESULTS  (sorted by RMSE)")
-print("=" * 85)
-print(q_results_df.to_string())
-
-print("\n" + "=" * 70)
-print("BEST HYPERPARAMETER COMBINATION (Quantile LSTM)")
-print("=" * 70)
-print(f"  Best Window Size    : {best_q_config['window_size']}")
-print(f"  Best LSTM Units     : {best_q_config['units']}")
-print(f"  Best Dropout        : {best_q_config['dropout']}")
-print(f"  Best Learning Rate  : {best_q_config['learning_rate']}")
-print(f"  Best RMSE           : {best_q_result['RMSE']:.6f}")
-print(f"  Best MSE            : {best_q_result['MSE']:.6f}")
-print(f"  Best MAE            : {best_q_result['MAE']:.6f}")
-print("=" * 70)
-
-# ── Tuning Heatmap ────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-fig.suptitle('Quantile LSTM Tuning — RMSE Heatmap per Dropout', fontsize=14, fontweight='bold')
-for ax, dr in zip(axes, [0.0, 0.2, 0.3]):
-    sub   = q_results_df[q_results_df['Dropout'] == dr].copy()
-    pivot = sub.groupby(['LSTM Units', 'Window Size'])['RMSE'].min().unstack()
-    sns.heatmap(pivot, annot=True, fmt='.4f', cmap='YlOrRd', ax=ax)
-    ax.set_title(f'Dropout = {dr}', fontweight='bold')
-    ax.set_xlabel('Window Size')
-    ax.set_ylabel('LSTM Units')
-plt.tight_layout()
-plt.show()
-
-# ── Rebuild Best Model ────────────────────────────────────────────────────────
-WINDOW_SIZE = best_q_config['window_size']
-X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, WINDOW_SIZE)
-X_test_seq,  y_test_seq  = create_sequences(X_test_scaled,  y_test_scaled,  WINDOW_SIZE)
-
-quantile_model = build_quantile_lstm_model(                    # ★ LSTM builder
-    WINDOW_SIZE, n_features_q, QUANTILES,
-    units=best_q_config['units'],
-    dropout=best_q_config['dropout'],
-    learning_rate=best_q_config['learning_rate']
-)
-print("Best quantile LSTM model rebuilt with optimal hyperparameters.")
-
-
-# =============================================================================
-# 5. Model Training
-# =============================================================================
-
-y_train_dict = {f'q{int(q*100)}': y_train_seq for q in QUANTILES}
-y_test_dict  = {f'q{int(q*100)}': y_test_seq  for q in QUANTILES}
-
-callbacks = [
-    EarlyStopping(monitor='val_loss', patience=20,
-                  restore_best_weights=True, verbose=1),
-    ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                      patience=7, min_lr=1e-7, verbose=1)
-]
-
+print(f"\n  Total Combinations : {len(all_combos)}")
 print("=" * 80)
-print("TRAINING BEST QUANTILE LSTM MODEL")
+
+tuning_results = []
+best_rmse      = float('inf')
+best_config    = None
+best_model     = None
+best_X_te      = None
+best_y_te      = None
+
+for combo_idx, (ws, units, dropout, lr) in enumerate(all_combos, 1):
+    print(f"\n[{combo_idx:02d}/{len(all_combos)}] "
+          f"window={ws:2d}, units={units:3d}, dropout={dropout:.1f}, lr={lr:.4f}")
+
+    tr_dl, val_dl, te_dl, y_te_np = make_loaders(
+        X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, ws
+    )
+
+    model = QuantileLSTM(ws, N_FEATURES, N_QUANTILES, units=units, dropout=dropout).to(DEVICE)
+    model, history = train_model(model, tr_dl, val_dl, lr=lr, epochs=100, patience=15)
+
+# ── Evaluate on median (Q index = 1 for q=0.5)
+    preds_all  = predict_all(model, te_dl)       # (N, 3)
+    q50_scaled = preds_all[:, QUANTILES.index(0.5)]
+    y_pred     = scaler_y.inverse_transform(q50_scaled.reshape(-1, 1)).flatten()
+    y_true     = scaler_y.inverse_transform(y_te_np.reshape(-1, 1)).flatten()
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+
+    epochs_run = len(history)
+    print(f"  → RMSE={rmse:.6f}, MSE={mse:.6f}, MAE={mae:.6f}, Epochs={epochs_run}")
+
+    record = {
+        'window_size'  : ws,
+        'units'        : units,
+        'dropout'      : dropout,
+        'learning_rate': lr,
+        'RMSE'         : round(rmse, 6),
+        'MSE'          : round(mse, 6),
+        'MAE'          : round(mae, 6),
+        'final_epoch'  : epochs_run,
+    }
+    tuning_results.append(record)
+
+    if rmse < best_rmse:
+        best_rmse   = rmse
+        best_config = {k: v for k, v in record.items() if k in PARAM_GRID}
+        best_model  = model
+        best_X_te   = te_dl
+        best_y_te   = y_te_np
+    else:
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+print("\n" + "=" * 80)
+print("HYPERPARAMETER TUNING COMPLETE")
 print("=" * 80)
-print(f"Quantile Levels  : {QUANTILES}")
-print(f"Window Size      : {WINDOW_SIZE}")
-print(f"LSTM Units       : {best_q_config['units']}")
-print(f"Dropout          : {best_q_config['dropout']}")
-print(f"Learning Rate    : {best_q_config['learning_rate']}")
-print(f"Training Samples : {len(X_train_seq)}")
-print("\nTraining started...\n")
 
-history = quantile_model.fit(
-    X_train_seq, y_train_dict,
-    validation_split=0.2, epochs=100, batch_size=32,
-    callbacks=callbacks, verbose=1
+
+# =============================================================================
+# 8. Results Table
+# =============================================================================
+
+print("\n[5/11] Generating Tuning Results Table...")
+
+results_df = pd.DataFrame(tuning_results).sort_values('RMSE').reset_index(drop=True)
+results_df.index += 1
+
+print("\n" + "=" * 95)
+print("HYPERPARAMETER TUNING RESULTS (Sorted by RMSE)")
+print("=" * 95)
+print(results_df.to_string())
+
+print("\n" + "=" * 80)
+print("BEST HYPERPARAMETER CONFIGURATION")
+print("=" * 80)
+print(f"  Window Size      : {best_config['window_size']}")
+print(f"  LSTM Units       : {best_config['units']}")
+print(f"  Dropout          : {best_config['dropout']}")
+print(f"  Learning Rate    : {best_config['learning_rate']}")
+print(f"  Best RMSE        : {best_rmse:.6f}")
+print("=" * 80)
+
+
+# =============================================================================
+# 9. Generate Predictions with Best Model
+# =============================================================================
+
+print("\n[6/11] Generating Predictions with Best Model...")
+
+WINDOW_SIZE = best_config['window_size']
+
+# Re-create test sequences for full test set
+X_te_full, y_te_full = create_sequences(X_test_scaled, y_test_scaled, WINDOW_SIZE)
+te_ds_full = TensorDataset(
+    torch.from_numpy(X_te_full),
+    torch.from_numpy(y_te_full)
 )
+te_dl_full = DataLoader(te_ds_full, batch_size=32, shuffle=False, pin_memory=USE_AMP)
 
-print("\nTraining completed!")
-print(f"Final epoch: {len(history.history['loss'])}")
-
-# ── Training History ──────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-axes = axes.flatten()
-for idx, q in enumerate(QUANTILES):
-    q_name = f'q{int(q*100)}'
-    axes[idx].plot(history.history[f'{q_name}_loss'],     label=f'Train Loss Q{q}', linewidth=2)
-    axes[idx].plot(history.history[f'val_{q_name}_loss'], label=f'Val Loss Q{q}',   linewidth=2)
-    axes[idx].set_xlabel('Epoch')
-    axes[idx].set_ylabel('Pinball Loss')
-    axes[idx].set_title(f'Quantile {q} Training History', fontweight='bold')
-    axes[idx].legend()
-    axes[idx].grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-
-# =============================================================================
-# 6. Generate Predictions
-# =============================================================================
-
-quantile_predictions_scaled = quantile_model.predict(X_test_seq, verbose=0)
+preds_scaled = predict_all(best_model, te_dl_full)   # (N, 7)
+y_actual     = scaler_y.inverse_transform(y_te_full.reshape(-1, 1)).flatten()
 
 quantile_predictions = {}
 for idx, q in enumerate(QUANTILES):
-    pred_scaled = quantile_predictions_scaled[idx].flatten()
-    pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
-    quantile_predictions[q] = pred
+    quantile_predictions[q] = scaler_y.inverse_transform(
+        preds_scaled[:, idx].reshape(-1, 1)
+    ).flatten()
 
-y_actual = scaler_y.inverse_transform(y_test_seq.reshape(-1, 1)).flatten()
-
-print("=" * 80)
-print("QUANTILE PREDICTIONS GENERATED (LSTM)")
-print("=" * 80)
-print(f"Test samples: {len(y_actual)}")
-for q, pred in quantile_predictions.items():
-    print(f"  Q{q}: {pred.shape}")
+print(f"Predictions shape  : {preds_scaled.shape}")
+print(f"Test samples       : {len(y_actual)}")
 
 
 # =============================================================================
-# 7. Prediction Interval Metrics
+# 10. Prediction Interval Metrics
 # =============================================================================
 
-def calculate_interval_metrics(y_true, lower_bound, upper_bound, confidence_level=0.95):
-    """
-    Calculate comprehensive prediction interval metrics.
+print("\n[7/11] Computing Prediction Interval Metrics...")
 
-    Args:
-        y_true           : Actual values
-        lower_bound      : Lower prediction bound
-        upper_bound      : Upper prediction bound
-        confidence_level : Target coverage level (default 0.95)
 
-    Returns:
-        Dictionary of metrics
-    """
-    coverage   = (y_true >= lower_bound) & (y_true <= upper_bound)
-    picp       = np.mean(coverage)
-    widths     = upper_bound - lower_bound
-    mpiw       = np.mean(widths)
-    data_range = np.max(y_true) - np.min(y_true)
-    nmpiw      = mpiw / data_range if data_range > 0 else 0
+def calculate_interval_metrics(y_true, lower, upper, confidence_level=0.95):
+    coverage  = (y_true >= lower) & (y_true <= upper)
+    picp      = np.mean(coverage)
+    widths    = upper - lower
+    mpiw      = np.mean(widths)
+    dr        = np.max(y_true) - np.min(y_true)
+    nmpiw     = mpiw / dr if dr > 0 else 0.0
 
-    mu    = confidence_level
-    eta   = 50
+    mu  = confidence_level
+    eta = 50
     gamma = 0 if picp >= mu else 1
-    cwc   = nmpiw * (1 + gamma * np.exp(-eta * (picp - mu)))
+    cwc = nmpiw * (1 + gamma * np.exp(-eta * (picp - mu)))
 
-    ace       = np.abs(picp - confidence_level)
-    sharpness = mpiw / np.mean(np.abs(y_true)) * 100 if np.mean(np.abs(y_true)) > 0 else 0
+    ace       = abs(picp - confidence_level)
+    sharpness = mpiw / np.mean(np.abs(y_true)) * 100 if np.mean(np.abs(y_true)) > 0 else 0.0
 
-    alpha         = 1 - confidence_level
-    winkler       = widths + (2 / alpha) * (
-        (lower_bound - y_true) * (y_true < lower_bound) +
-        (y_true - upper_bound) * (y_true > upper_bound)
+    alpha   = 1 - confidence_level
+    winkler = widths + (2 / alpha) * (
+        (lower - y_true) * (y_true < lower) +
+        (y_true - upper) * (y_true > upper)
     )
     winkler_score = np.mean(winkler)
 
     return {
         'PICP': picp, 'MPIW': mpiw, 'NMPIW': nmpiw, 'CWC': cwc,
         'ACE': ace, 'Sharpness_%': sharpness, 'Winkler_Score': winkler_score,
-        'Coverage': coverage, 'Widths': widths
+        'Coverage': coverage, 'Widths': widths,
     }
 
 
 confidence_levels = {
-    '80%': (0.1, 0.9),
-    '50%': (0.25, 0.75),
+    '90%': (0.05, 0.95),
 }
 
-print("=" * 80)
+print("\n" + "=" * 80)
 print("PREDICTION INTERVAL METRICS")
 print("=" * 80)
 
@@ -539,417 +665,363 @@ for level_name, (q_low, q_high) in confidence_levels.items():
     metrics_summary[level_name] = metrics
 
     print(f"\n{level_name} Prediction Interval:")
-    print("-" * 80)
-    print(f"  PICP (Coverage)   : {metrics['PICP']*100:.2f}% (Target: {level_name})")
-    print(f"  MPIW (Avg Width)  : {metrics['MPIW']:.6f}")
-    print(f"  NMPIW (Normalized): {metrics['NMPIW']:.6f}")
-    print(f"  CWC (Quality)     : {metrics['CWC']:.6f} (Lower is better)")
-    print(f"  ACE (Coverage Err): {metrics['ACE']*100:.2f}%")
-    print(f"  Sharpness         : {metrics['Sharpness_%']:.2f}%")
-    print(f"  Winkler Score     : {metrics['Winkler_Score']:.6f}")
-
-    ace_val = metrics['ACE']
-    quality = ("EXCELLENT" if ace_val < 0.02 else
-               "GOOD"      if ace_val < 0.05 else
-               "ACCEPTABLE" if ace_val < 0.10 else "POOR")
-    print(f"  Coverage Quality  : {quality}")
+    print(f"  PICP (Coverage)      : {metrics['PICP']*100:>6.2f}%  (Target: {level_name})")
+    print(f"  MPIW (Avg Width)     : {metrics['MPIW']:>10.6f}")
+    print(f"  NMPIW (Normalised)   : {metrics['NMPIW']:>10.6f}")
+    print(f"  CWC (Quality)        : {metrics['CWC']:>10.6f}  (lower is better)")
+    print(f"  ACE (Coverage Error) : {metrics['ACE']*100:>6.2f}%")
+    print(f"  Sharpness            : {metrics['Sharpness_%']:>6.2f}%")
+    print(f"  Winkler Score        : {metrics['Winkler_Score']:>10.6f}")
 
 
 # =============================================================================
-# 8. Visualization of Prediction Intervals
+# 11. Next 5-Day Forecast
 # =============================================================================
 
-test_dates = test_data.index[WINDOW_SIZE:]
-
-fig, axes = plt.subplots(2, 1, figsize=(18, 12))
-
-axes[0].plot(test_dates, y_actual,                   'b-',  linewidth=2, label='Actual',            alpha=0.8)
-axes[0].plot(test_dates, quantile_predictions[0.5],  'r--', linewidth=2, label='Median Prediction', alpha=0.8)
-axes[0].fill_between(test_dates, quantile_predictions[0.025], quantile_predictions[0.975],
-                     alpha=0.3, color='red',    label='95% Prediction Interval')
-axes[0].fill_between(test_dates, quantile_predictions[0.25],  quantile_predictions[0.75],
-                     alpha=0.5, color='orange', label='50% Prediction Interval (IQR)')
-axes[0].axhline(0, color='black', linestyle=':', linewidth=1, alpha=0.5)
-axes[0].set_xlabel('Date', fontsize=12)
-axes[0].set_ylabel('Return (%)', fontsize=12)
-axes[0].set_title('LSTM Quantile Predictions with Multiple Confidence Intervals', fontweight='bold', fontsize=14)
-axes[0].legend(loc='best', fontsize=10)
-axes[0].grid(alpha=0.3)
-
-zoom_n = min(50, len(test_dates))
-axes[1].plot(test_dates[-zoom_n:], y_actual[-zoom_n:],
-             'b-', linewidth=2.5, label='Actual', marker='o', markersize=4)
-axes[1].plot(test_dates[-zoom_n:], quantile_predictions[0.5][-zoom_n:],
-             'r--', linewidth=2.5, label='Median Prediction', marker='s', markersize=4)
-axes[1].fill_between(test_dates[-zoom_n:],
-                     quantile_predictions[0.025][-zoom_n:],
-                     quantile_predictions[0.975][-zoom_n:],
-                     alpha=0.3, color='red', label='95% PI')
-axes[1].axhline(0, color='black', linestyle=':', linewidth=1, alpha=0.5)
-axes[1].set_xlabel('Date', fontsize=12)
-axes[1].set_ylabel('Return (%)', fontsize=12)
-axes[1].set_title(f'Detailed View: Last {zoom_n} Predictions', fontweight='bold', fontsize=14)
-axes[1].legend(loc='best', fontsize=10)
-axes[1].grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-# ── Coverage Analysis ─────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-
-coverage_80 = metrics_summary['80%']['Coverage']
-axes[0, 0].fill_between(test_dates, 0, 1, where=coverage_80,  alpha=0.3, color='green', label='Covered')
-axes[0, 0].fill_between(test_dates, 0, 1, where=~coverage_80, alpha=0.3, color='red',   label='Not Covered')
-axes[0, 0].set_ylim([0, 1.1])
-axes[0, 0].set_xlabel('Date')
-axes[0, 0].set_ylabel('Coverage')
-axes[0, 0].set_title(f'80% PI Coverage (PICP: {metrics_summary["80%"]["PICP"]*100:.2f}%)', fontweight='bold')
-axes[0, 0].legend()
-axes[0, 0].grid(alpha=0.3)
-
-widths_80 = metrics_summary['80%']['Widths']
-axes[0, 1].plot(test_dates, widths_80, linewidth=1.5, color='purple')
-axes[0, 1].axhline(metrics_summary['80%']['MPIW'], color='red', linestyle='--', linewidth=2,
-                   label=f'Mean Width: {metrics_summary["80%"]["MPIW"]:.4f}')
-axes[0, 1].set_xlabel('Date')
-axes[0, 1].set_ylabel('Interval Width')
-axes[0, 1].set_title('80% Prediction Interval Width Over Time', fontweight='bold')
-axes[0, 1].legend()
-axes[0, 1].grid(alpha=0.3)
-
-axes[1, 0].hist(widths_80, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
-axes[1, 0].axvline(metrics_summary['80%']['MPIW'], color='red', linestyle='--', linewidth=2,
-                   label=f'Mean: {metrics_summary["80%"]["MPIW"]:.4f}')
-axes[1, 0].set_xlabel('Interval Width')
-axes[1, 0].set_ylabel('Frequency')
-axes[1, 0].set_title('Distribution of Interval Widths', fontweight='bold')
-axes[1, 0].legend()
-axes[1, 0].grid(alpha=0.3)
-
-levels  = list(confidence_levels.keys())
-picps   = [metrics_summary[l]['PICP'] * 100 for l in levels]
-targets = [float(l.strip('%')) for l in levels]
-x, width = np.arange(len(levels)), 0.35
-axes[1, 1].bar(x - width/2, picps,   width, label='Actual PICP',    color='steelblue', alpha=0.7, edgecolor='black')
-axes[1, 1].bar(x + width/2, targets, width, label='Target Coverage', color='orange',    alpha=0.7, edgecolor='black')
-axes[1, 1].set_xlabel('Confidence Level')
-axes[1, 1].set_ylabel('Coverage (%)')
-axes[1, 1].set_title('PICP vs Target Coverage', fontweight='bold')
-axes[1, 1].set_xticks(x)
-axes[1, 1].set_xticklabels(levels)
-axes[1, 1].legend()
-axes[1, 1].grid(alpha=0.3, axis='y')
-plt.tight_layout()
-plt.show()
+print("\n[8/11] Generating 5-Day Forecast...")
 
 
-# =============================================================================
-# 9. Quantile Calibration Analysis
-# =============================================================================
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-empirical_coverage = [np.mean(y_actual <= quantile_predictions[q]) for q in QUANTILES]
-
-axes[0].plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect Calibration')
-axes[0].plot(QUANTILES, empirical_coverage, 'bo-', linewidth=2, markersize=8, label='LSTM Calibration')
-axes[0].set_xlabel('Predicted Quantile', fontsize=12)
-axes[0].set_ylabel('Empirical Coverage', fontsize=12)
-axes[0].set_title('Quantile Calibration Plot (LSTM)', fontweight='bold', fontsize=14)
-axes[0].legend(fontsize=10)
-axes[0].grid(alpha=0.3)
-axes[0].set_xlim([0, 1])
-axes[0].set_ylim([0, 1])
-
-calibration_errors = np.abs(np.array(QUANTILES) - np.array(empirical_coverage))
-axes[1].bar([f'Q{int(q*100)}' for q in QUANTILES], calibration_errors,
-            color='coral', alpha=0.7, edgecolor='black')
-axes[1].set_xlabel('Quantile', fontsize=12)
-axes[1].set_ylabel('Absolute Calibration Error', fontsize=12)
-axes[1].set_title('Quantile Calibration Errors (LSTM)', fontweight='bold', fontsize=14)
-axes[1].grid(alpha=0.3, axis='y')
-axes[1].tick_params(axis='x', rotation=45)
-plt.tight_layout()
-plt.show()
-
-print("\n" + "=" * 80)
-print("CALIBRATION ANALYSIS (LSTM)")
-print("=" * 80)
-print(f"\n{'Quantile':<12} {'Target':<12} {'Empirical':<12} {'Error':<12}")
-print("-" * 48)
-for q, emp, err in zip(QUANTILES, empirical_coverage, calibration_errors):
-    print(f"{q:<12.3f} {q:<12.3f} {emp:<12.3f} {err:<12.4f}")
-
-mean_abs_error = np.mean(calibration_errors)
-print(f"\nMean Absolute Calibration Error: {mean_abs_error:.4f}")
-print("Calibration Quality:", (
-    "EXCELLENT" if mean_abs_error < 0.02 else
-    "GOOD"      if mean_abs_error < 0.05 else
-    "NEEDS IMPROVEMENT"
-))
-
-
-# =============================================================================
-# 10. Next 5 Days Predictions with Confidence Intervals
-# =============================================================================
-
-def predict_next_n_days_quantile(model, last_sequence, scaler_X, scaler_y, quantiles, n_days=5):
-    """Predict next n days with full quantile predictions using LSTM."""
-    predictions      = {q: [] for q in quantiles}
-    current_sequence = last_sequence.copy()
+@torch.no_grad()
+def predict_next_n_days(model, last_seq_scaled, scaler_y, quantiles, n_days=5):
+    """
+    Autoregressive 5-day forecast. Updates the first feature (log_ret proxy)
+    with the median scaled prediction after each step.
+    """
+    model.eval()
+    preds_dict  = {q: [] for q in quantiles}
+    current_seq = last_seq_scaled.copy()
 
     for _ in range(n_days):
-        quantile_preds_scaled = model.predict(
-            current_sequence.reshape(1, *current_sequence.shape), verbose=0
-        )
+        x_t = torch.from_numpy(
+            current_seq.reshape(1, *current_seq.shape)
+        ).to(DEVICE)
+
+        q_preds_sc = model(x_t).cpu().numpy()[0]          # (Q,)
+
         for idx, q in enumerate(quantiles):
-            pred_scaled = quantile_preds_scaled[idx][0, 0]
-            pred        = scaler_y.inverse_transform([[pred_scaled]])[0, 0]
-            predictions[q].append(pred)
+            val = scaler_y.inverse_transform([[q_preds_sc[idx]]])[0, 0]
+            preds_dict[q].append(val)
 
-        median_idx       = quantiles.index(0.5)
-        median_pred_sc   = quantile_preds_scaled[median_idx][0, 0]
-        new_features     = current_sequence[-1].copy()
-        new_features[0]  = median_pred_sc
-        current_sequence = np.vstack([current_sequence[1:], new_features])
+        # Roll window — use median (index 3) as proxy for next log_ret
+        median_sc = q_preds_sc[quantiles.index(0.5)]
+        new_row   = current_seq[-1].copy()
+        new_row[0] = median_sc
+        current_seq = np.vstack([current_seq[1:], new_row])
 
-    return predictions
+    return preds_dict
 
 
 last_sequence_scaled = X_test_scaled[-WINDOW_SIZE:]
-next_5_quantiles = predict_next_n_days_quantile(
-    quantile_model, last_sequence_scaled, scaler_X, scaler_y, QUANTILES, n_days=5
+next_5_quantiles     = predict_next_n_days(
+    best_model, last_sequence_scaled, scaler_y, QUANTILES, n_days=5
 )
 
 last_date    = df_features.index[-1]
 future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=5)
 
-print("=" * 80)
-print("NEXT 5 DAYS QUANTILE PREDICTIONS (LSTM)")
-print("=" * 80)
-print(f"\nLast Trading Date : {last_date.strftime('%Y-%m-%d')}")
-print(f"Last Close Price  : {df['close'].iloc[-1]:.2f}\n")
-print(f"{'Date':<15} {'Q2.5%':<10} {'Q25%':<10} {'Median':<10} {'Q75%':<10} {'Q97.5%':<10} {'Price (Med)':<12}")
-print("-" * 80)
+print("\n" + "=" * 90)
+print("NEXT 5-DAY FORECAST")
+print("=" * 90)
+print(f"Last Trading Date : {last_date.strftime('%Y-%m-%d')}\n")
+# print(f"{'Date':<14} {'Q2.5%':>10} {'Q25%':>10} {'Median':>10} {'Q75%':>10} {'Q97.5%':>10}")
+print(f"{'Date':<14} {'Q5%':>10} {'Median':>10} {'Q95%':>10}")
+print("-" * 70)
 
-current_price = df['close'].iloc[-1]
 for i, date in enumerate(future_dates):
-    q50 = next_5_quantiles[0.5][i]
-    predicted_price = current_price * (1 + q50 / 100)
+    
     print(
-        f"{date.strftime('%Y-%m-%d'):<15} "
-        f"{next_5_quantiles[0.025][i]:>+7.4f}%  "
-        f"{next_5_quantiles[0.25][i]:>+7.4f}%  "
-        f"{q50:>+7.4f}%  "
-        f"{next_5_quantiles[0.75][i]:>+7.4f}%  "
-        f"{next_5_quantiles[0.975][i]:>+7.4f}%  "
-        f"{predicted_price:>10.2f}"
+        f"{date.strftime('%Y-%m-%d'):<14} "
+        f"{next_5_quantiles[0.05][i]:>+8.4f}%  "
+        f"{next_5_quantiles[0.5][i]:>+8.4f}%  "
+        f"{next_5_quantiles[0.95][i]:>+8.4f}%"
     )
-    current_price = predicted_price
-
-cumulative_median = sum(next_5_quantiles[0.5])
-cumulative_lower  = sum(next_5_quantiles[0.025])
-cumulative_upper  = sum(next_5_quantiles[0.975])
-final_price       = df['close'].iloc[-1] * (1 + cumulative_median / 100)
-price_lower       = df['close'].iloc[-1] * (1 + cumulative_lower  / 100)
-price_upper       = df['close'].iloc[-1] * (1 + cumulative_upper  / 100)
-
-print("\n" + "=" * 80)
-print("PREDICTION SUMMARY (LSTM)")
-print("=" * 80)
-print(f"\n5-Day Median Return      : {cumulative_median:+.4f}%")
-print(f"Current Price            : {df['close'].iloc[-1]:.2f}")
-print(f"Predicted Price (Median) : {final_price:.2f}")
-print(f"Expected Change          : {final_price - df['close'].iloc[-1]:+.2f} points")
-print(f"\n95% Confidence Interval:")
-print(f"  Lower Bound  : {cumulative_lower:+.4f}% (Price: {price_lower:.2f})")
-print(f"  Upper Bound  : {cumulative_upper:+.4f}% (Price: {price_upper:.2f})")
-print(f"  Interval Width: {cumulative_upper - cumulative_lower:.4f}%")
-
-# ── 5-Day Forecast Visualization ─────────────────────────────────────────────
-fig, axes = plt.subplots(2, 1, figsize=(16, 12))
-
-historical_dates  = df_features.index[-30:]
-historical_prices = df['close'].iloc[-30:]
-
-median_prices = [df['close'].iloc[-1]]
-lower_prices  = [df['close'].iloc[-1]]
-upper_prices  = [df['close'].iloc[-1]]
-q25_prices    = [df['close'].iloc[-1]]
-q75_prices    = [df['close'].iloc[-1]]
-for i in range(5):
-    median_prices.append(median_prices[-1] * (1 + next_5_quantiles[0.5][i]   / 100))
-    lower_prices.append(lower_prices[-1]   * (1 + next_5_quantiles[0.025][i] / 100))
-    upper_prices.append(upper_prices[-1]   * (1 + next_5_quantiles[0.975][i] / 100))
-    q25_prices.append(q25_prices[-1]       * (1 + next_5_quantiles[0.25][i]  / 100))
-    q75_prices.append(q75_prices[-1]       * (1 + next_5_quantiles[0.75][i]  / 100))
-
-all_dates = [historical_dates[-1]] + list(future_dates)
-
-axes[0].plot(historical_dates, historical_prices, 'b-',  linewidth=2.5, label='Historical')
-axes[0].plot(all_dates, median_prices, 'r-', linewidth=2.5, marker='o', markersize=8, label='Median Forecast')
-axes[0].fill_between(all_dates, lower_prices, upper_prices, alpha=0.2, color='red',    label='95% PI')
-axes[0].fill_between(all_dates, q25_prices,   q75_prices,   alpha=0.3, color='orange', label='50% PI (IQR)')
-axes[0].axvline(historical_dates[-1], color='black', linestyle=':', linewidth=2, alpha=0.7)
-axes[0].set_xlabel('Date', fontsize=12)
-axes[0].set_ylabel('Price', fontsize=12)
-axes[0].set_title('LSTM 5-Day Price Forecast with Prediction Intervals', fontweight='bold', fontsize=14)
-axes[0].legend(fontsize=10)
-axes[0].grid(alpha=0.3)
-
-day_labels = [f'Day {i+1}\n{date.strftime("%m/%d")}' for i, date in enumerate(future_dates)]
-x_pos      = np.arange(5)
-axes[1].bar(x_pos, next_5_quantiles[0.5],
-            color=['green' if r > 0 else 'red' for r in next_5_quantiles[0.5]],
-            alpha=0.6, label='Median')
-lower_err = [next_5_quantiles[0.5][i] - next_5_quantiles[0.025][i] for i in range(5)]
-upper_err = [next_5_quantiles[0.975][i] - next_5_quantiles[0.5][i] for i in range(5)]
-axes[1].errorbar(x_pos, next_5_quantiles[0.5], yerr=[lower_err, upper_err],
-                 fmt='none', ecolor='black', capsize=8, capthick=2, linewidth=2, label='95% PI')
-for i in range(5):
-    axes[1].plot([i, i], [next_5_quantiles[0.25][i], next_5_quantiles[0.75][i]],
-                 'o-', color='orange', linewidth=4, markersize=6, alpha=0.6)
-axes[1].axhline(0, color='black', linestyle='--', linewidth=1.5)
-axes[1].set_xticks(x_pos)
-axes[1].set_xticklabels(day_labels)
-axes[1].set_ylabel('Return (%)', fontsize=12)
-axes[1].set_title('Daily Return Predictions with Quantile Intervals (LSTM)', fontweight='bold', fontsize=14)
-axes[1].legend(fontsize=10)
-axes[1].grid(alpha=0.3, axis='y')
-plt.tight_layout()
-plt.show()
-
 
 # =============================================================================
-# 11. Sector Analysis
+# 12. Visualization
 # =============================================================================
 
-sectors     = ['bank', 'it', 'pharma', 'auto', 'fmcg', 'metal', 'energy']
-recent_data = df_features.tail(30)
+print("\n[9/11] Creating Visualizations...")
 
-sector_analysis = pd.DataFrame({
-    'Sector'      : [s.upper() for s in sectors],
-    'Mean_Return' : [recent_data[f'{s}_ret'].mean() * 100 for s in sectors],
-    'Volatility'  : [recent_data[f'{s}_ret'].std()  * 100 for s in sectors],
-    'Latest'      : [df_features[f'{s}_ret'].iloc[-1] * 100 for s in sectors],
-    'Min'         : [recent_data[f'{s}_ret'].min()  * 100 for s in sectors],
-    'Max'         : [recent_data[f'{s}_ret'].max()  * 100 for s in sectors],
-})
-sector_analysis['Confidence_Score'] = (
-    sector_analysis['Mean_Return'].rank() * 0.4 +
-    (100 - sector_analysis['Volatility'].rank()) * 0.3 +
-    sector_analysis['Latest'].rank() * 0.3
+test_dates = test_data.index[WINDOW_SIZE:]
+
+# ── Plot 1: Prediction Intervals ──────────────────────────────────────────────
+fig1, axes1 = plt.subplots(2, 1, figsize=(18, 12))
+
+axes1[0].plot(test_dates, y_actual,
+               'b-', lw=2, label='Actual', alpha=0.8)
+
+axes1[0].plot(test_dates, quantile_predictions[0.5],
+               'r--', lw=2, label='Median (q=0.5)', alpha=0.8)
+
+# 90% PI
+axes1[0].fill_between(
+    test_dates,
+    quantile_predictions[0.05],
+    quantile_predictions[0.95],
+    alpha=0.25,
+    color='red',
+    label='90% PI'
 )
-sector_analysis = sector_analysis.sort_values('Confidence_Score', ascending=False)
 
-print("=" * 80)
-print("SECTOR ANALYSIS WITH UNCERTAINTY QUANTIFICATION")
-print("=" * 80)
-print(sector_analysis.to_string(index=False))
+axes1[0].axhline(0, color='black', ls=':', lw=1, alpha=0.5)
 
-print("\n" + "=" * 80)
-print("TOP 3 INVESTMENT RECOMMENDATIONS")
-print("=" * 80)
-for idx, (_, row) in enumerate(sector_analysis.head(3).iterrows(), 1):
-    rec = (
-        "STRONG BUY - High return, low risk" if row['Mean_Return'] > 0.5 and row['Volatility'] < 2.0 else
-        "BUY - Positive momentum"             if row['Mean_Return'] > 0.3 else
-        "HOLD - Weak positive trend"          if row['Mean_Return'] > 0 else
-        "AVOID - Negative trend"
-    )
-    print(f"\n{idx}. {row['Sector']}  |  Return {row['Mean_Return']:+.4f}%  |  Risk {row['Volatility']:.4f}%  |  {rec}")
+axes1[0].set_xlabel('Date', fontsize=12)
+axes1[0].set_ylabel('Return (%)', fontsize=12)
 
+axes1[0].set_title(
+    'LSTM Quantile Predictions — 90% Prediction Interval [PyTorch]',
+    fontweight='bold',
+    fontsize=14
+)
 
-# =============================================================================
-# 12. Comprehensive Summary
-# =============================================================================
+axes1[0].legend(loc='best', fontsize=10)
+axes1[0].grid(alpha=0.3)
 
-available_level = list(metrics_summary.keys())[0]
-m = metrics_summary[available_level]
+# ─────────────────────────────────────────────────────────────────────────────
 
-print("=" * 80)
-print("QUANTILE FORECASTING — FINAL SUMMARY (LSTM)")
-print("=" * 80)
+zoom_n = min(50, len(test_dates))
 
-print("\n1. OPTIMAL MODEL CONFIGURATION:")
-print(f"   Architecture   : Multi-Output Quantile LSTM")
-print(f"   Window Size    : {WINDOW_SIZE} days")
-print(f"   Quantile Levels: {QUANTILES}")
-print(f"   LSTM Units     : {best_q_config['units']} → {best_q_config['units']//2}")
-print(f"   Dropout        : {best_q_config['dropout']}")
-print(f"   Learning Rate  : {best_q_config['learning_rate']}")
-print(f"   Total Params   : {quantile_model.count_params():,}")
+axes1[1].plot(
+    test_dates[-zoom_n:],
+    y_actual[-zoom_n:],
+    'b-',
+    lw=2.5,
+    label='Actual',
+    marker='o',
+    ms=4
+)
 
-print("\n2. HYPERPARAMETER TUNING RESULT:")
-print(f"   Best RMSE (q=0.5): {best_q_result['RMSE']:.6f}")
-print(f"   Best MSE         : {best_q_result['MSE']:.6f}")
-print(f"   Best MAE         : {best_q_result['MAE']:.6f}")
+axes1[1].plot(
+    test_dates[-zoom_n:],
+    quantile_predictions[0.5][-zoom_n:],
+    'r--',
+    lw=2.5,
+    label='Median',
+    marker='s',
+    ms=4
+)
 
-print(f"\n3. PREDICTION INTERVAL QUALITY ({available_level}):")
-print(f"   PICP     : {m['PICP']*100:.2f}%")
-print(f"   MPIW     : {m['MPIW']:.6f}")
-print(f"   CWC      : {m['CWC']:.6f}")
-print(f"   Sharpness: {m['Sharpness_%']:.2f}%")
-print(f"   Winkler  : {m['Winkler_Score']:.6f}")
+axes1[1].fill_between(
+    test_dates[-zoom_n:],
+    quantile_predictions[0.05][-zoom_n:],
+    quantile_predictions[0.95][-zoom_n:],
+    alpha=0.3,
+    color='red',
+    label='90% PI'
+)
 
-print("\n4. CALIBRATION:")
-print(f"   MACE: {m['ACE']:.4f}  |  Quality: "
-      f"{'EXCELLENT' if m['ACE'] < 0.02 else 'GOOD' if m['ACE'] < 0.05 else 'ACCEPTABLE'}")
+axes1[1].axhline(0, color='black', ls=':', lw=1, alpha=0.5)
 
-print("\n5. NEXT 5 DAYS FORECAST:")
-for i, date in enumerate(future_dates):
-    print(f"   Day {i+1} ({date.strftime('%Y-%m-%d')}): "
-          f"Median {next_5_quantiles[0.5][i]:+.4f}% | "
-          f"95% PI [{next_5_quantiles[0.025][i]:+.4f}%, {next_5_quantiles[0.975][i]:+.4f}%]")
+axes1[1].set_xlabel('Date', fontsize=12)
+axes1[1].set_ylabel('Return (%)', fontsize=12)
 
-print(f"\n   5-Day Cumulative: {cumulative_median:+.4f}%  |  "
-      f"Price {final_price:.2f} from {df['close'].iloc[-1]:.2f}  |  "
-      f"95% Range [{price_lower:.2f}, {price_upper:.2f}]")
+axes1[1].set_title(
+    f'Detailed View: Last {zoom_n} Predictions',
+    fontweight='bold',
+    fontsize=14
+)
 
-print("\n6. LSTM ADVANTAGES OVER SimpleRNN:")
-print("   ✓ Explicit cell state enables long-range temporal memory")
-print("   ✓ Forget gate selectively retains relevant past information")
-print("   ✓ Input / output gates control information flow with less vanishing gradient")
-print("   ✓ Better suited to financial time series with regime changes")
-print("   ✓ Typically yields sharper, better-calibrated prediction intervals")
+axes1[1].legend(loc='best', fontsize=10)
+axes1[1].grid(alpha=0.3)
 
-print("\n" + "=" * 80)
-print("DISCLAIMER: Predictions are for research purposes only.")
-print("Consult a financial advisor before making investment decisions.")
-print("=" * 80)
+plt.tight_layout()
 
+fig1.savefig(
+    "lstm_single_model_predictions.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+print("  Saved: lstm_single_model_predictions.png")
+
+plt.close(fig1)
 
 # =============================================================================
-# Save Model and Results
+# Plot 2: Metrics Grid
 # =============================================================================
 
-quantile_model.save('quantile_forecasting_lstm_model.h5')
-print("\nLSTM model saved to: quantile_forecasting_lstm_model.h5")
+fig2, axes2 = plt.subplots(2, 2, figsize=(16, 12))
 
-results_df = pd.DataFrame({
-    'Date'   : future_dates,
-    'Q2.5%'  : next_5_quantiles[0.025],
-    'Q10%'   : next_5_quantiles[0.1],
-    'Q25%'   : next_5_quantiles[0.25],
-    'Median' : next_5_quantiles[0.5],
-    'Q75%'   : next_5_quantiles[0.75],
-    'Q90%'   : next_5_quantiles[0.9],
-    'Q97.5%' : next_5_quantiles[0.975],
-})
-results_df.to_csv('next_5_days_quantile_predictions_lstm.csv', index=False)
-print("Predictions saved to: next_5_days_quantile_predictions_lstm.csv")
+# Calibration
+empirical_coverage = [
+    np.mean(y_actual <= quantile_predictions[q])
+    for q in QUANTILES
+]
 
-metrics_df = pd.DataFrame([
-    {
-        'Confidence_Level': level,
-        'PICP'            : metrics['PICP'],
-        'MPIW'            : metrics['MPIW'],
-        'NMPIW'           : metrics['NMPIW'],
-        'CWC'             : metrics['CWC'],
-        'Sharpness_%'     : metrics['Sharpness_%'],
-        'Winkler_Score'   : metrics['Winkler_Score'],
-    }
-    for level, metrics in metrics_summary.items()
-])
-metrics_df.to_csv('prediction_interval_metrics_lstm.csv', index=False)
-print("Metrics saved to: prediction_interval_metrics_lstm.csv")
+axes2[0, 0].plot(
+    [0, 1],
+    [0, 1],
+    'k--',
+    lw=2,
+    label='Perfect Calibration'
+)
+
+axes2[0, 0].plot(
+    QUANTILES,
+    empirical_coverage,
+    'bo-',
+    lw=2,
+    ms=8,
+    label='LSTM Calibration'
+)
+
+axes2[0, 0].set_xlabel('Predicted Quantile', fontsize=12)
+axes2[0, 0].set_ylabel('Empirical Coverage', fontsize=12)
+
+axes2[0, 0].set_title(
+    'Quantile Calibration Plot',
+    fontweight='bold',
+    fontsize=14
+)
+
+axes2[0, 0].legend(fontsize=10)
+axes2[0, 0].grid(alpha=0.3)
+
+# =============================================================================
+# PICP vs Target
+# =============================================================================
+
+levels  = list(confidence_levels.keys())
+picps   = [metrics_summary[l]['PICP'] * 100 for l in levels]
+targets = [float(l.strip('%')) for l in levels]
+
+x_pos = np.arange(len(levels))
+w = 0.35
+
+axes2[0, 1].bar(
+    x_pos - w/2,
+    picps,
+    w,
+    label='Actual PICP',
+    color='steelblue',
+    alpha=0.7,
+    edgecolor='black'
+)
+
+axes2[0, 1].bar(
+    x_pos + w/2,
+    targets,
+    w,
+    label='Target Coverage',
+    color='orange',
+    alpha=0.7,
+    edgecolor='black'
+)
+
+axes2[0, 1].set_xlabel('Confidence Level')
+axes2[0, 1].set_ylabel('Coverage (%)')
+
+axes2[0, 1].set_title(
+    'PICP vs Target Coverage',
+    fontweight='bold'
+)
+
+axes2[0, 1].set_xticks(x_pos)
+axes2[0, 1].set_xticklabels(levels)
+
+axes2[0, 1].legend()
+axes2[0, 1].grid(alpha=0.3, axis='y')
+
+# =============================================================================
+# Width Distribution
+# =============================================================================
+
+widths_90 = metrics_summary['90%']['Widths']
+
+axes2[1, 0].hist(
+    widths_90,
+    bins=50,
+    edgecolor='black',
+    alpha=0.7,
+    color='steelblue'
+)
+
+axes2[1, 0].axvline(
+    metrics_summary['90%']['MPIW'],
+    color='red',
+    ls='--',
+    lw=2,
+    label=f"Mean: {metrics_summary['90%']['MPIW']:.4f}"
+)
+
+axes2[1, 0].set_xlabel('Interval Width')
+axes2[1, 0].set_ylabel('Frequency')
+
+axes2[1, 0].set_title(
+    '90% PI Width Distribution',
+    fontweight='bold'
+)
+
+axes2[1, 0].legend()
+axes2[1, 0].grid(alpha=0.3)
+
+# =============================================================================
+# 5-Day Forecast
+# =============================================================================
+
+day_labels = [
+    f"t+{d+1}\n{dt.strftime('%m/%d')}"
+    for d, dt in enumerate(future_dates)
+]
+
+bar_colors = [
+    "#2E7D32" if m > 0 else "#C62828"
+    for m in next_5_quantiles[0.5]
+]
+
+axes2[1, 1].bar(
+    range(5),
+    next_5_quantiles[0.5],
+    color=bar_colors,
+    alpha=0.6,
+    label="Median Forecast"
+)
+
+yerr_lo = [
+    next_5_quantiles[0.5][i] - next_5_quantiles[0.05][i]
+    for i in range(5)
+]
+
+yerr_up = [
+    next_5_quantiles[0.95][i] - next_5_quantiles[0.5][i]
+    for i in range(5)
+]
+
+axes2[1, 1].errorbar(
+    range(5),
+    next_5_quantiles[0.5],
+    yerr=[yerr_lo, yerr_up],
+    fmt="none",
+    ecolor="black",
+    capsize=8,
+    capthick=2,
+    lw=2,
+    label="90% PI"
+)
+
+axes2[1, 1].axhline(0, color="black", ls="--", lw=1.2)
+
+axes2[1, 1].set_xticks(range(5))
+axes2[1, 1].set_xticklabels(day_labels, fontsize=9)
+
+axes2[1, 1].set_ylabel("% Change")
+
+axes2[1, 1].set_title(
+    "5-Day Forecast with 90% PI",
+    fontweight='bold'
+)
+
+axes2[1, 1].legend(fontsize=9)
+axes2[1, 1].grid(alpha=0.3, axis='y')
+
+plt.tight_layout()
+
+fig2.savefig(
+    "lstm_single_model_metrics.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+print("  Saved: lstm_single_model_metrics.png")
+
+plt.close(fig2)

@@ -6,6 +6,20 @@ from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import random
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ── Random Seeds ──────────────────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
 
 # ==========================================
 # 1. Load Data & Select Features
@@ -153,9 +167,9 @@ for window_size in WINDOW_SIZES:
 
     model = NiftyRNN(
         input_size  = X_train.shape[2],
-        hidden_size = 64,
+        hidden_size = 256,
         output_size = forecast_days,
-        num_layers  = 2,
+        num_layers  = 4,
         dropout     = 0.2
     )
 

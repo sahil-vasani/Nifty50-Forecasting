@@ -19,16 +19,29 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import warnings; warnings.filterwarnings("ignore")
+import random
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WINDOW_SIZES = [20, 30, 40]          # ← grid search space
+WINDOW_SIZES = [20, 30, 40 ]          # ← grid search space
 HORIZONS     = 5
-HIDDEN       = 64
-LAYERS       = 2
-BATCH        = 64
-EPOCHS       = 80
-LR           = 1e-3
+HIDDEN       = 256
+LAYERS       = 4
+BATCH        = 32
+EPOCHS       = 100
+LR           = 5e-4
 TRAIN_RATIO  = 0.80
 Q_UPPER      = 0.95
 Q_LOWER      = 0.05
@@ -76,7 +89,7 @@ class RNNModel(nn.Module):
         self.head = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, 32), nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(32, out_dim))
     def forward(self, x):
         out, _ = self.rnn(x)
