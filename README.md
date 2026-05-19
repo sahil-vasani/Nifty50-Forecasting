@@ -163,20 +163,6 @@ Nifty50-Forecasting/
 │       ├── gru.py              # GRU — Seq2Seq & Seq2Seq+Attention
 │       └── transformer.py      # Encoder-Decoder Transformer
 │
-├── notebooks/
-│   ├── 01_EDA.ipynb
-│   ├── 02_ARIMA_Family.ipynb
-│   ├── 03_SARIMA.ipynb
-│   ├── 04_GARCH.ipynb
-│   ├── 05_RNN.ipynb
-│   ├── 06_LSTM.ipynb
-│   ├── 07_GRU.ipynb
-│   └── 08_Transformer.ipynb
-│
-├── results/
-│   ├── figures/                # All plots and visualisations
-│   └── metrics/                # Saved model performance tables
-│
 ├── requirements.txt
 └── README.md
 ```
